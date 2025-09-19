@@ -72,9 +72,8 @@ jobs:
       # Build and Push Docker image for Frontend
       - name: Build and Push Frontend Image
         run: |
-          REG=${{ secrets.ACR_LOGIN_SERVER }}
-          docker build -t $REG/frontend:latest .
-          docker push $REG/frontend:latest
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/frontend:latest .
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/frontend:latest
 
       - name: Set Kubernetes context (get AKS credentials)
         uses: azure/aks-set-context@v3
