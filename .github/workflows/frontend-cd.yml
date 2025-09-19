@@ -71,6 +71,7 @@ jobs:
 
       # Build and Push Docker image for Frontend
       - name: Build and Push Frontend Image
+        working-directory: ./frontend
         run: |
           docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/frontend:latest .
           docker push ${{ secrets.ACR_LOGIN_SERVER }}/frontend:latest
