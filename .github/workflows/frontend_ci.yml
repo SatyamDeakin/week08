@@ -1,68 +1,63 @@
-name: Frontend CI
+# week08/.github/workflows/frontend_ci.yml
+name: Frontend CI - Build & Push Image
 
 on:
+  # Manual trigger
   workflow_dispatch:
+
+  # Auto on pushes to development or main (frontend-only changes or workflow changes)
   push:
     branches: [ development, main ]
     paths:
       - 'frontend/**'
       - '.github/workflows/frontend_ci.yml'
-  pull_request:
-    branches: [ development, main ]
-    paths:
-      - 'frontend/**'
-      - '.github/workflows/frontend_ci.yml'
 
-concurrency:
-  group: frontend-ci-${{ github.ref }}
-  cancel-in-progress: true
+# Global env
+env:
+  # e.g., mystudentregistry.azurecr.io
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  # e.g., mystudentregistry   (the short registry name for az acr login)
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  # Tags
+  BRANCH: ${{ github.ref_name }}           # development | main
+  IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}
 
 jobs:
-  # Optional PR check: build only (no push)
-  pr-check:
-    if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Docker build (no push)
-        run: docker build -t test-frontend ./frontend
-
-  build-and-push:
-    if: ${{ github.event_name == 'push' }}
+  build_and_push_frontend:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write      # for azure/login OIDC
+      id-token: write      # for OIDC login
       contents: read
-    env:
-      ACR_NAME: ${{ secrets.ACR_NAME }}
-      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-      BRANCH: ${{ github.ref_name }}
-      SHA: ${{ github.sha }}
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Azure login (OIDC)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Azure login via OIDC (no client secret needed)
+      - name: Azure Login
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: ACR login
+      # Login to Azure Container Registry (use the registry NAME here)
+      - name: Login to Azure Container Registry
         run: az acr login --name "${{ env.ACR_NAME }}"
 
-      - name: Set up Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build & push image (keep your repo path)
+      # Build and push Docker image for Frontend (keep your original repo path)
+      - name: Build and Push Frontend Image
         run: |
-          docker build -t ${{ env.ACR_LOGIN_SERVER }}/frontend:latest ./frontend
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/frontend:latest ./frontend/
           docker tag  ${{ env.ACR_LOGIN_SERVER }}/frontend:latest ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.BRANCH }}
-          docker tag  ${{ env.ACR_LOGIN_SERVER }}/frontend:latest ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.SHA }}
+          docker tag  ${{ env.ACR_LOGIN_SERVER }}/frontend:latest ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}
           docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
           docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.BRANCH }}
-          docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.SHA }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ env.IMAGE_TAG }}
 
-      - name: Azure logout
+      - name: Logout from Azure
         if: always()
         run: az logout
