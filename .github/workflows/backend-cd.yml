@@ -15,17 +15,39 @@ on:
         description: 'Kubernetes namespace (dev or prod)'
         required: true
         default: 'dev'
-      product_service_name:
-        description: 'K8s Service name for product API'
+
+      # --- App Deployment + container names (avoid grepping) ---
+      product_deploy_name:
+        description: 'Deployment name for product API'
+        required: true
+        default: 'product-service-w08e1'
+      product_container_name:
+        description: 'Container name inside product deployment'
         required: true
         default: 'product-service'
-      order_service_name:
-        description: 'K8s Service name for order API'
+
+      order_deploy_name:
+        description: 'Deployment name for order API'
+        required: true
+        default: 'order-service-w08e1'
+      order_container_name:
+        description: 'Container name inside order deployment'
         required: true
         default: 'order-service'
-      # Optional: set images explicitly if you want to pin to this commit/tag
+
+      # --- Service names used to fetch LB IPs ---
+      product_service_name:
+        description: 'Service name for product API'
+        required: true
+        default: 'product-service-w08e1'
+      order_service_name:
+        description: 'Service name for order API'
+        required: true
+        default: 'order-service-w08e1'
+
+      # Pin app images to this commit’s tag
       set_images:
-        description: 'Set Deployment images to ACR images for this commit? (true/false)'
+        description: 'Set app Deployment images to ACR images for this commit? (true/false)'
         required: true
         default: 'true'
 
@@ -72,38 +94,27 @@ jobs:
           kubectl -n "${{ inputs.namespace }}" apply -f k8s/product-service.yaml
           kubectl -n "${{ inputs.namespace }}" apply -f k8s/order-service.yaml
 
-      # OPTIONAL: set images (assumes your CI pushed :${{ github.sha }} tags)
-      - name: Set images to this commit (if requested)
+      # --- Set images ONLY for the app deployments (never DB) ---
+      - name: Set images to this commit (apps only, if requested)
         if: ${{ inputs.set_images == 'true' }}
-        shell: bash
         run: |
-          # Detect container names for each Deployment (first container)
-          PROD_DEP=$(kubectl -n "${{ inputs.namespace }}" get deploy -o name | grep -E 'product|prod' | head -n1 | cut -d/ -f2 || echo "")
-          ORDER_DEP=$(kubectl -n "${{ inputs.namespace }}" get deploy -o name | grep -E 'order'        | head -n1 | cut -d/ -f2 || echo "")
-
-          if [ -z "$PROD_DEP" ] || [ -z "$ORDER_DEP" ]; then
-            echo "Could not auto-detect deployment names. Falling back to product-service/order-service."
-            PROD_DEP="product-service"
-            ORDER_DEP="order-service"
-          fi
-
-          PROD_CONT=$(kubectl -n "${{ inputs.namespace }}" get deploy "$PROD_DEP" -o jsonpath='{.spec.template.spec.containers[0].name}')
-          ORDER_CONT=$(kubectl -n "${{ inputs.namespace }}" get deploy "$ORDER_DEP" -o jsonpath='{.spec.template.spec.containers[0].name}')
-
           IMG_PROD="${{ env.ACR_LOGIN_SERVER }}/product_service:${{ github.sha }}"
           IMG_ORDER="${{ env.ACR_LOGIN_SERVER }}/order_service:${{ github.sha }}"
 
-          echo "Setting $PROD_DEP/$PROD_CONT -> $IMG_PROD"
-          echo "Setting $ORDER_DEP/$ORDER_CONT -> $IMG_ORDER"
+          echo "Setting ${{ inputs.product_deploy_name }}/${{ inputs.product_container_name }} -> $IMG_PROD"
+          kubectl -n "${{ inputs.namespace }}" set image \
+            deploy/${{ inputs.product_deploy_name }} \
+            ${{ inputs.product_container_name }}="$IMG_PROD"
 
-          kubectl -n "${{ inputs.namespace }}" set image deploy/$PROD_DEP  $PROD_CONT="$IMG_PROD"
-          kubectl -n "${{ inputs.namespace }}" set image deploy/$ORDER_DEP $ORDER_CONT="$IMG_ORDER"
+          echo "Setting ${{ inputs.order_deploy_name }}/${{ inputs.order_container_name }} -> $IMG_ORDER"
+          kubectl -n "${{ inputs.namespace }}" set image \
+            deploy/${{ inputs.order_deploy_name }} \
+            ${{ inputs.order_container_name }}="$IMG_ORDER"
 
-          kubectl -n "${{ inputs.namespace }}" rollout status deploy/$PROD_DEP  --timeout=300s
-          kubectl -n "${{ inputs.namespace }}" rollout status deploy/$ORDER_DEP --timeout=300s
+          kubectl -n "${{ inputs.namespace }}" rollout status deploy/${{ inputs.product_deploy_name }} --timeout=300s
+          kubectl -n "${{ inputs.namespace }}" rollout status deploy/${{ inputs.order_deploy_name }}   --timeout=300s
 
       - name: Ensure Services are type LoadBalancer
-        shell: bash
         run: |
           kubectl -n "${{ inputs.namespace }}" patch svc "${{ inputs.product_service_name }}" -p '{"spec":{"type":"LoadBalancer"}}' --type=merge || true
           kubectl -n "${{ inputs.namespace }}" patch svc "${{ inputs.order_service_name }}"   -p '{"spec":{"type":"LoadBalancer"}}' --type=merge || true
@@ -123,15 +134,14 @@ jobs:
             P_HOST=$(kubectl -n "$NS" get svc "$PSVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
             O_HOST=$(kubectl -n "$NS" get svc "$OSVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 
-            # prefer IP; fall back to hostname (some clouds fill hostname only)
             [ -z "$P_IP" ] && P_IP="$P_HOST"
             [ -z "$O_IP" ] && O_IP="$O_HOST"
 
             if [[ -n "$P_IP" && -n "$O_IP" ]]; then
-              echo "Product: $P_IP"
-              echo "Order:   $O_IP"
               echo "P_ADDR=$P_IP" >> $GITHUB_ENV
               echo "O_ADDR=$O_IP" >> $GITHUB_ENV
+              echo "Product: $P_IP"
+              echo "Order:   $O_IP"
               exit 0
             fi
             sleep 5
@@ -145,7 +155,6 @@ jobs:
         id: make_outputs
         shell: bash
         run: |
-          # Change ports here if your Services expose different ones
           P_URL="http://${P_ADDR}:8000"
           O_URL="http://${O_ADDR}:8001"
           echo "product_url=$P_URL" >> $GITHUB_OUTPUT
