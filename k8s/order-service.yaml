@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
       - name: order-service-container
-        image: week8acr1219400691.azurecr.io/order_service:latest
+        image: satyamstudentregistry.azurecr.io/order_service:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8000
