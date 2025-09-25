@@ -1,73 +1,158 @@
-name: Backend CD (AKS)
+name: CD - Deploy Backend Services to AKS
 
 on:
-  push:
-    branches: [ development, main ]
-    paths:
-      - 'backend/**'
-      - 'k8s/**'
-      - '.github/workflows/backend-cd.yml'
   workflow_dispatch:
-
-concurrency:
-  group: backend-cd-${{ github.ref }}
-  cancel-in-progress: true
+    inputs:
+      aks_cluster_name:
+        description: 'AKS cluster name'
+        required: true
+        default: 'aks-demo'
+      aks_resource_group:
+        description: 'AKS resource group'
+        required: true
+        default: 'rg-aks-demo'
+      namespace:
+        description: 'Kubernetes namespace (dev or prod)'
+        required: true
+        default: 'dev'
+      product_service_name:
+        description: 'K8s Service name for product API'
+        required: true
+        default: 'product-service'
+      order_service_name:
+        description: 'K8s Service name for order API'
+        required: true
+        default: 'order-service'
+      # Optional: set images explicitly if you want to pin to this commit/tag
+      set_images:
+        description: 'Set Deployment images to ACR images for this commit? (true/false)'
+        required: true
+        default: 'true'
 
 env:
-  AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
-  AKS_CLUSTER_NAME:   ${{ secrets.AKS_CLUSTER_NAME }}
-  ACR_NAME:           ${{ secrets.ACR_NAME }}
-  ACR_LOGIN_SERVER:   ${{ secrets.ACR_LOGIN_SERVER }}
-  ENV_NAME:           ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-  NAMESPACE:          ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-  IMAGE:              ${{ secrets.ACR_LOGIN_SERVER }}/my-backend:${{ github.sha }}
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }} # e.g. mystudentregistry.azurecr.io
 
 jobs:
-  deploy:
+  deploy_backend:
     runs-on: ubuntu-latest
-    environment:
-      name: ${{ env.ENV_NAME }}
-    permissions: { id-token: write, contents: read }
+    environment: Production
+
+    outputs:
+      PRODUCT_API_URL: ${{ steps.make_outputs.outputs.product_url }}
+      ORDER_API_URL:   ${{ steps.make_outputs.outputs.order_url }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: azure/login@v2
+      - name: Azure login (client secret)
+        uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - uses: azure/aks-set-context@v4
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
-          cluster-name:   ${{ env.AKS_CLUSTER_NAME }}
+          resource-group: ${{ inputs.aks_resource_group }}
+          cluster-name:   ${{ inputs.aks_cluster_name }}
 
-      - name: Ensure namespace
-        run: kubectl get ns "${{ env.NAMESPACE }}" || kubectl create ns "${{ env.NAMESPACE }}"
+      - name: Ensure namespace exists
+        run: |
+          kubectl get ns "${{ inputs.namespace }}" || kubectl create ns "${{ inputs.namespace }}"
 
-      - name: Wait for image in ACR
+      - name: Apply backend infrastructure (ConfigMaps/Secrets/DBs)
+        run: |
+          kubectl -n "${{ inputs.namespace }}" apply -f k8s/configmaps.yaml
+          kubectl -n "${{ inputs.namespace }}" apply -f k8s/secrets.yaml
+          kubectl -n "${{ inputs.namespace }}" apply -f k8s/product-db.yaml
+          kubectl -n "${{ inputs.namespace }}" apply -f k8s/order-db.yaml
+
+      - name: Apply backend services (Deployments/Services)
+        run: |
+          kubectl -n "${{ inputs.namespace }}" apply -f k8s/product-service.yaml
+          kubectl -n "${{ inputs.namespace }}" apply -f k8s/order-service.yaml
+
+      # OPTIONAL: set images (assumes your CI pushed :${{ github.sha }} tags)
+      - name: Set images to this commit (if requested)
+        if: ${{ inputs.set_images == 'true' }}
         shell: bash
         run: |
-          for i in {1..12}; do
-            if az acr repository show-manifests --name "${{ env.ACR_NAME }}" --repository my-backend \
-              --query "[?tags && contains(join(',', tags), '${{ github.sha }}')]" -o tsv | head -n1 | grep -q .; then
-              echo "Image found"; break
+          # Detect container names for each Deployment (first container)
+          PROD_DEP=$(kubectl -n "${{ inputs.namespace }}" get deploy -o name | grep -E 'product|prod' | head -n1 | cut -d/ -f2 || echo "")
+          ORDER_DEP=$(kubectl -n "${{ inputs.namespace }}" get deploy -o name | grep -E 'order'        | head -n1 | cut -d/ -f2 || echo "")
+
+          if [ -z "$PROD_DEP" ] || [ -z "$ORDER_DEP" ]; then
+            echo "Could not auto-detect deployment names. Falling back to product-service/order-service."
+            PROD_DEP="product-service"
+            ORDER_DEP="order-service"
+          fi
+
+          PROD_CONT=$(kubectl -n "${{ inputs.namespace }}" get deploy "$PROD_DEP" -o jsonpath='{.spec.template.spec.containers[0].name}')
+          ORDER_CONT=$(kubectl -n "${{ inputs.namespace }}" get deploy "$ORDER_DEP" -o jsonpath='{.spec.template.spec.containers[0].name}')
+
+          IMG_PROD="${{ env.ACR_LOGIN_SERVER }}/product_service:${{ github.sha }}"
+          IMG_ORDER="${{ env.ACR_LOGIN_SERVER }}/order_service:${{ github.sha }}"
+
+          echo "Setting $PROD_DEP/$PROD_CONT -> $IMG_PROD"
+          echo "Setting $ORDER_DEP/$ORDER_CONT -> $IMG_ORDER"
+
+          kubectl -n "${{ inputs.namespace }}" set image deploy/$PROD_DEP  $PROD_CONT="$IMG_PROD"
+          kubectl -n "${{ inputs.namespace }}" set image deploy/$ORDER_DEP $ORDER_CONT="$IMG_ORDER"
+
+          kubectl -n "${{ inputs.namespace }}" rollout status deploy/$PROD_DEP  --timeout=300s
+          kubectl -n "${{ inputs.namespace }}" rollout status deploy/$ORDER_DEP --timeout=300s
+
+      - name: Ensure Services are type LoadBalancer
+        shell: bash
+        run: |
+          kubectl -n "${{ inputs.namespace }}" patch svc "${{ inputs.product_service_name }}" -p '{"spec":{"type":"LoadBalancer"}}' --type=merge || true
+          kubectl -n "${{ inputs.namespace }}" patch svc "${{ inputs.order_service_name }}"   -p '{"spec":{"type":"LoadBalancer"}}' --type=merge || true
+
+      - name: Wait for LoadBalancer IPs/hostnames (up to 5 min)
+        id: wait_ips
+        shell: bash
+        run: |
+          NS="${{ inputs.namespace }}"
+          PSVC="${{ inputs.product_service_name }}"
+          OSVC="${{ inputs.order_service_name }}"
+
+          for i in $(seq 1 60); do
+            echo "Attempt $i/60..."
+            P_IP=$(kubectl -n "$NS" get svc "$PSVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            O_IP=$(kubectl -n "$NS" get svc "$OSVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            P_HOST=$(kubectl -n "$NS" get svc "$PSVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            O_HOST=$(kubectl -n "$NS" get svc "$OSVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+            # prefer IP; fall back to hostname (some clouds fill hostname only)
+            [ -z "$P_IP" ] && P_IP="$P_HOST"
+            [ -z "$O_IP" ] && O_IP="$O_HOST"
+
+            if [[ -n "$P_IP" && -n "$O_IP" ]]; then
+              echo "Product: $P_IP"
+              echo "Order:   $O_IP"
+              echo "P_ADDR=$P_IP" >> $GITHUB_ENV
+              echo "O_ADDR=$O_IP" >> $GITHUB_ENV
+              exit 0
             fi
-            echo "Waiting for image... ($i/12)"; sleep 10
+            sleep 5
           done
 
-      - name: Update image in manifest
-        run: sed -i "s#image: .*/my-backend:.*#image: ${{ env.IMAGE }}#g" k8s/backend-deployment.yaml
+          echo "LoadBalancer addresses not ready after timeout."
+          kubectl -n "$NS" get svc
+          exit 1
 
-      - name: Apply manifests
+      - name: Build service URLs & expose as outputs
+        id: make_outputs
+        shell: bash
         run: |
-          kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/backend-deployment.yaml
-          kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/backend-service.yaml
-          [ -f k8s/backend-ingress.yaml ] && kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/backend-ingress.yaml
+          # Change ports here if your Services expose different ones
+          P_URL="http://${P_ADDR}:8000"
+          O_URL="http://${O_ADDR}:8001"
+          echo "product_url=$P_URL" >> $GITHUB_OUTPUT
+          echo "order_url=$O_URL"   >> $GITHUB_OUTPUT
+          echo "Product API URL: $P_URL"
+          echo "Order   API URL: $O_URL"
 
-      - name: Rollout status
-        run: kubectl -n "${{ env.NAMESPACE }}" rollout status deploy/my-backend --timeout=300s
-
-      - name: Logout Azure
+      - name: Azure logout
         if: always()
         run: az logout
