@@ -16,26 +16,17 @@ on:
         required: true
         default: 'dev'
 
-      # --- App Deployment + container names (avoid grepping) ---
+      # App Deployment names (NOT the DBs)
       product_deploy_name:
         description: 'Deployment name for product API'
         required: true
         default: 'product-service-w08e1'
-      product_container_name:
-        description: 'Container name inside product deployment'
-        required: true
-        default: 'product-service'
-
       order_deploy_name:
         description: 'Deployment name for order API'
         required: true
         default: 'order-service-w08e1'
-      order_container_name:
-        description: 'Container name inside order deployment'
-        required: true
-        default: 'order-service'
 
-      # --- Service names used to fetch LB IPs ---
+      # Service names (to fetch LoadBalancer IPs)
       product_service_name:
         description: 'Service name for product API'
         required: true
@@ -52,7 +43,8 @@ on:
         default: 'true'
 
 env:
-  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }} # e.g. mystudentregistry.azurecr.io
+  # e.g., mystudentregistry.azurecr.io
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
 
 jobs:
   deploy_backend:
@@ -97,19 +89,18 @@ jobs:
       # --- Set images ONLY for the app deployments (never DB) ---
       - name: Set images to this commit (apps only, if requested)
         if: ${{ inputs.set_images == 'true' }}
+        shell: bash
         run: |
           IMG_PROD="${{ env.ACR_LOGIN_SERVER }}/product_service:${{ github.sha }}"
           IMG_ORDER="${{ env.ACR_LOGIN_SERVER }}/order_service:${{ github.sha }}"
 
-          echo "Setting ${{ inputs.product_deploy_name }}/${{ inputs.product_container_name }} -> $IMG_PROD"
+          echo "Setting image on ${{ inputs.product_deploy_name }} -> $IMG_PROD"
           kubectl -n "${{ inputs.namespace }}" set image \
-            deploy/${{ inputs.product_deploy_name }} \
-            ${{ inputs.product_container_name }}="$IMG_PROD"
+            deploy/${{ inputs.product_deploy_name }} '*='"$IMG_PROD"
 
-          echo "Setting ${{ inputs.order_deploy_name }}/${{ inputs.order_container_name }} -> $IMG_ORDER"
+          echo "Setting image on ${{ inputs.order_deploy_name }} -> $IMG_ORDER"
           kubectl -n "${{ inputs.namespace }}" set image \
-            deploy/${{ inputs.order_deploy_name }} \
-            ${{ inputs.order_container_name }}="$IMG_ORDER"
+            deploy/${{ inputs.order_deploy_name }} '*='"$IMG_ORDER"
 
           kubectl -n "${{ inputs.namespace }}" rollout status deploy/${{ inputs.product_deploy_name }} --timeout=300s
           kubectl -n "${{ inputs.namespace }}" rollout status deploy/${{ inputs.order_deploy_name }}   --timeout=300s
