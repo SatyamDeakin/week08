@@ -1,74 +1,124 @@
-name: Frontend CD (AKS)
+# week08/.github/workflows/frontend-cd.yml
+name: CD - Deploy Frontend to AKS
 
 on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      product_api_ip:
+        description: 'External IP of Product Service'
+        required: true
+        default: 'http://4.195.19.118:8000'
+      order_api_ip:
+        description: 'External IP of Order Service (e.g., http://Y.Y.Y.Y:8001)'
+        required: true
+        default: 'http://4.200.105.170:8001'
+      aks_cluster_name:
+        description: 'Name of the AKS Cluster to deploy to'
+        required: true
+        default: '<aks_name>'
+      aks_resource_group:
+        description: 'Resource Group of the AKS Cluster'
+        required: true
+        default: '<resource_group_name>'
+
+  # Reusable workflow
+  workflow_call:
+    inputs:
+      product_api_ip:   { required: true, type: string }
+      order_api_ip:     { required: true, type: string }
+      aks_cluster_name: { required: true, type: string }
+      aks_resource_group: { required: true, type: string }
+
+  # Auto deploy when frontend or workflow changes on branches
   push:
     branches: [ development, main ]
     paths:
       - 'frontend/**'
-      - 'k8s/**'
+      - 'k8s/frontend.yaml'
       - '.github/workflows/frontend-cd.yml'
-  workflow_dispatch:
-
-concurrency:
-  group: frontend-cd-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
-  AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
-  AKS_CLUSTER_NAME:   ${{ secrets.AKS_CLUSTER_NAME }}
-  ACR_NAME:           ${{ secrets.ACR_NAME }}
-  ACR_LOGIN_SERVER:   ${{ secrets.ACR_LOGIN_SERVER }}
-  # derive environment/namespace from branch
-  ENV_NAME:           ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-  NAMESPACE:          ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-  IMAGE:              ${{ secrets.ACR_LOGIN_SERVER }}/my-frontend:${{ github.sha }}
+  # map branch → environment/namespace
+  ENV_NAME:  ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+  NAMESPACE: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+  ACR_NAME: ${{ secrets.ACR_NAME }}                # e.g., mystudentregistry
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}# e.g., mystudentregistry.azurecr.io
+  IMAGE: ${{ secrets.ACR_LOGIN_SERVER }}/frontend:${{ github.sha }}
 
 jobs:
-  deploy:
+  deploy_frontend:
     runs-on: ubuntu-latest
-    environment:
-      name: ${{ env.ENV_NAME }}   # prod can be approval-gated; dev usually open
-    permissions: { id-token: write, contents: read }
-    steps:
-      - uses: actions/checkout@v4
+    # Use dynamic env on push; keep "Production" when called manually if you prefer:
+    environment: ${{ (github.event_name == 'push') && env.ENV_NAME || 'Production' }}
+    permissions:
+      id-token: write
+      contents: read
 
-      - uses: azure/login@v2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---- Azure auth (OIDC, no client secret) ----
+      - name: Azure Login
+        uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - uses: azure/aks-set-context@v4
-        with:
-          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
-          cluster-name:   ${{ env.AKS_CLUSTER_NAME }}
+      # ACR login (use registry NAME here, not login server)
+      - name: Login to Azure Container Registry
+        run: az acr login --name "${{ env.ACR_NAME }}"
 
-      - name: Ensure namespace
-        run: kubectl get ns "${{ env.NAMESPACE }}" || kubectl create ns "${{ env.NAMESPACE }}"
-
-      - name: Wait for image in ACR (avoid race with CI)
+      # ---- Inject backend IPs into frontend/main.js (works for both manual and auto) ----
+      - name: Inject Backend IPs into Frontend main.js
         shell: bash
         run: |
-          for i in {1..12}; do
-            if az acr repository show-manifests --name "${{ env.ACR_NAME }}" --repository my-frontend \
-              --query "[?tags && contains(join(',', tags), '${{ github.sha }}')]" -o tsv | head -n1 | grep -q .; then
-              echo "Image found"; break
-            fi
-            echo "Waiting for image... ($i/12)"; sleep 10
-          done
+          PROD_IP="${{ inputs.product_api_ip }}"
+          ORDER_IP="${{ inputs.order_api_ip }}"
 
-      - name: Update image in manifest
-        run: sed -i "s#image: .*/my-frontend:.*#image: ${{ env.IMAGE }}#g" k8s/frontend-deployment.yaml
+          # If running on push (no workflow inputs), keep existing values or set fallbacks
+          if [ -z "$PROD_IP" ]; then PROD_IP="http://example.product:8000"; fi
+          if [ -z "$ORDER_IP" ]; then ORDER_IP="http://example.order:8001"; fi
 
-      - name: Apply manifests
+          echo "Injecting API URLs into frontend/main.js"
+          sed -i "s|_PRODUCT_API_URL_|$PROD_IP|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|$ORDER_IP|g"  frontend/main.js
+
+          echo "--- main.js (preview) ---"
+          head -n 50 frontend/main.js || true
+          echo "-------------------------"
+
+      # Build & push image with same repo path you use elsewhere
+      - name: Build and Push Frontend Image
+        working-directory: ./frontend
         run: |
-          kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/frontend-deployment.yaml
-          kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/frontend-service.yaml
-          [ -f k8s/frontend-ingress.yaml ] && kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/frontend-ingress.yaml
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/frontend:latest .
+          docker tag  ${{ env.ACR_LOGIN_SERVER }}/frontend:latest ${{ env.IMAGE }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
+          docker push ${{ env.IMAGE }}
 
-      - name: Rollout status
-        run: kubectl -n "${{ env.NAMESPACE }}" rollout status deploy/my-frontend --timeout=240s
+      # ---- Get AKS context ----
+      - name: Set Kubernetes context (get AKS credentials)
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ inputs.aks_resource_group || secrets.AKS_RESOURCE_GROUP }}
+          cluster-name:   ${{ inputs.aks_cluster_name   || secrets.AKS_CLUSTER_NAME }}
 
-      - name: Logout Azure
+      # Apply manifest and set the image (no in-file edits)
+      - name: Apply manifest
+        run: kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/frontend.yaml
+
+      - name: Set image & rollout
+        shell: bash
+        run: |
+          # Adjust names if your Deployment/container aren't 'frontend'
+          kubectl -n "${{ env.NAMESPACE }}" set image deploy/frontend frontend="${{ env.IMAGE }}"
+          # If your container name is 'nginx', use:
+          # kubectl -n "${{ env.NAMESPACE }}" set image deploy/frontend nginx="${{ env.IMAGE }}"
+          kubectl -n "${{ env.NAMESPACE }}" rollout status deploy/frontend --timeout=240s
+
+      - name: Logout from Azure
         if: always()
         run: az logout
