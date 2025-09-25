@@ -1,8 +1,8 @@
 # week08/.github/workflows/frontend-cd.yml
+# week08/.github/workflows/frontend-cd.yml
 name: CD - Deploy Frontend to AKS
 
 on:
-  # Manual trigger
   workflow_dispatch:
     inputs:
       product_api_ip:
@@ -22,7 +22,6 @@ on:
         required: true
         default: 'rg-aks-demo'
 
-  # Auto-deploy when frontend or workflow changes
   push:
     branches: [ development, main ]
     paths:
@@ -31,53 +30,45 @@ on:
       - '.github/workflows/frontend-cd.yml'
 
 env:
-  # map branch → environment/namespace (dev on development, prod on main)
+  # dev on development, prod on main
   ENV_NAME:  ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
   NAMESPACE: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-  ACR_NAME:         ${{ secrets.ACR_NAME }}                 # e.g. satyamstudentregistry
-  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}         # e.g. satyamstudentregistry.azurecr.io
+  ACR_NAME:         ${{ secrets.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
   IMAGE:            ${{ secrets.ACR_LOGIN_SERVER }}/frontend:${{ github.sha }}
 
 jobs:
   deploy_frontend:
     runs-on: ubuntu-latest
-    # dynamic env for push; "Production" label for manual runs
-    environment: ${{ (github.event_name == 'push') && env.ENV_NAME || 'Production' }}
+
+    # ✅ use only github.* in the expression here
+    environment:
+      name: ${{ github.event_name == 'push'
+                && (github.ref_name == 'main' && 'prod' || 'dev')
+                || 'Production' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ✅ Azure login with Service Principal secret (NO OIDC)
       - name: Azure Login (service principal)
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # ACR login (use the registry NAME here)
       - name: Login to Azure Container Registry
         run: az acr login --name "${{ env.ACR_NAME }}"
 
-      # ---- Inject backend URLs into frontend/main.js ----
       - name: Inject Backend URLs into main.js
         shell: bash
         run: |
           PROD_URL="${{ inputs.product_api_ip }}"
           ORDER_URL="${{ inputs.order_api_ip }}"
-
-          # If running on push (no workflow inputs), keep existing placeholders or set fallbacks
           if [ -z "$PROD_URL" ]; then PROD_URL="http://example.product:8000"; fi
           if [ -z "$ORDER_URL" ]; then ORDER_URL="http://example.order:8001"; fi
-
-          echo "Injecting URLs into frontend/main.js"
           sed -i "s|_PRODUCT_API_URL_|$PROD_URL|g" frontend/main.js
           sed -i "s|_ORDER_API_URL_|$ORDER_URL|g"  frontend/main.js
 
-          echo "--- main.js (preview) ---"
-          head -n 50 frontend/main.js || true
-          echo "-------------------------"
-
-      # Build & push the frontend image
       - name: Build and Push Frontend Image
         working-directory: ./frontend
         run: |
@@ -86,7 +77,6 @@ jobs:
           docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
           docker push ${{ env.IMAGE }}
 
-      # ---- AKS context ----
       - name: Set Kubernetes context
         uses: azure/aks-set-context@v4
         with:
@@ -97,7 +87,6 @@ jobs:
         run: |
           kubectl get ns "${{ env.NAMESPACE }}" || kubectl create ns "${{ env.NAMESPACE }}"
 
-      # Apply manifest and set the image (use wildcard to avoid container-name mismatch)
       - name: Apply manifest
         run: kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/frontend.yaml
 
