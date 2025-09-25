@@ -1,5 +1,4 @@
 # week08/.github/workflows/frontend-cd.yml
-# week08/.github/workflows/frontend-cd.yml
 name: CD - Deploy Frontend to AKS
 
 on:
@@ -41,7 +40,7 @@ jobs:
   deploy_frontend:
     runs-on: ubuntu-latest
 
-    # ✅ use only github.* in the expression here
+    # Use only github.* context here
     environment:
       name: ${{ github.event_name == 'push'
                 && (github.ref_name == 'main' && 'prod' || 'dev')
@@ -51,6 +50,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Azure login with Service Principal (no OIDC)
       - name: Azure Login (service principal)
         uses: azure/login@v2
         with:
@@ -64,6 +64,7 @@ jobs:
         run: |
           PROD_URL="${{ inputs.product_api_ip }}"
           ORDER_URL="${{ inputs.order_api_ip }}"
+          # If running on push (no inputs), keep placeholders or set fallbacks
           if [ -z "$PROD_URL" ]; then PROD_URL="http://example.product:8000"; fi
           if [ -z "$ORDER_URL" ]; then ORDER_URL="http://example.order:8001"; fi
           sed -i "s|_PRODUCT_API_URL_|$PROD_URL|g" frontend/main.js
@@ -90,10 +91,13 @@ jobs:
       - name: Apply manifest
         run: kubectl -n "${{ env.NAMESPACE }}" apply -f k8s/frontend.yaml
 
+      # ✅ Correct image update: detect the container name and set it
       - name: Set image & rollout
         shell: bash
         run: |
-          kubectl -n "${{ env.NAMESPACE }}" set image deploy/frontend '*=' "${{ env.IMAGE }}"
+          CNAME=$(kubectl -n "${{ env.NAMESPACE }}" get deploy frontend -o jsonpath='{.spec.template.spec.containers[0].name}')
+          echo "Updating container '$CNAME' in deployment 'frontend' to image '${{ env.IMAGE }}'"
+          kubectl -n "${{ env.NAMESPACE }}" set image deploy/frontend "$CNAME=${{ env.IMAGE }}"
           kubectl -n "${{ env.NAMESPACE }}" rollout status deploy/frontend --timeout=300s
 
       - name: Azure logout
