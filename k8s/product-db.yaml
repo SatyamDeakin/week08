@@ -1,5 +1,3 @@
-# week08/k8s/product-db.yaml
-
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +6,8 @@ metadata:
     app: product-db
 spec:
   replicas: 1
+  strategy:
+    type: Recreate              # <- add this
   selector:
     matchLabels:
       app: product-db
@@ -16,39 +16,41 @@ spec:
       labels:
         app: product-db
     spec:
+      terminationGracePeriodSeconds: 10   # (optional) faster shutdowns
       containers:
       - name: postgres
-        image: postgres:15-alpine # Use the same PostgreSQL image as in Docker Compose
+        image: postgres:15-alpine
         ports:
-        - containerPort: 5432 # Default PostgreSQL port
+        - containerPort: 5432
         env:
         - name: POSTGRES_DB
           valueFrom:
             configMapKeyRef:
-              name: ecomm-config-w08e1 # ConfigMap name matches
+              name: ecomm-config-w08e1
               key: PRODUCTS_DB_NAME
         - name: POSTGRES_USER
           valueFrom:
             secretKeyRef:
-              name: ecomm-secrets-w08e1 # Secret name matches
+              name: ecomm-secrets-w08e1
               key: POSTGRES_USER
         - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: ecomm-secrets-w08e1 # Secret name matches
+              name: ecomm-secrets-w08e1
               key: POSTGRES_PASSWORD
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: product-db-service-w08e1 # Internal DNS name for the Product DB
+  name: product-db-service-w08e1
   labels:
     app: product-db
 spec:
   selector:
-    app: product-db # Selects pods with the label app: product-db
+    app: product-db
   ports:
     - protocol: TCP
-      port: 5432 # The port the service listens on (default PostgreSQL)
-      targetPort: 5432 # The port on the Pod (containerPort)
-  type: ClusterIP # Only accessible from within the cluster
+      port: 5432
+      targetPort: 5432
+  type: ClusterIP
+
