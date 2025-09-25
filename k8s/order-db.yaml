@@ -7,7 +7,7 @@ metadata:
 spec:
   replicas: 1
   strategy:
-    type: Recreate            # <- stop old pod before starting new
+    type: Recreate
   selector:
     matchLabels:
       app: order-db
@@ -16,28 +16,28 @@ spec:
       labels:
         app: order-db
     spec:
-      terminationGracePeriodSeconds: 10   # optional: faster shutdowns
+      terminationGracePeriodSeconds: 10
       containers:
-      - name: postgres
-        image: postgres:15-alpine
-        ports:
-        - containerPort: 5432
-        env:
-        - name: POSTGRES_DB
-          valueFrom:
-            configMapKeyRef:
-              name: ecomm-config-w08e1
-              key: ORDERS_DB_NAME
-        - name: POSTGRES_USER
-          valueFrom:
-            secretKeyRef:
-              name: ecomm-secrets-w08e1
-              key: POSTGRES_USER
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: ecomm-secrets-w08e1
-              key: POSTGRES_PASSWORD
+        - name: postgres
+          image: satyamstudentregistry.azurecr.io/postgres:15-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: ecomm-config-w08e1
+                  key: ORDERS_DB_NAME
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ecomm-secrets-w08e1
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ecomm-secrets-w08e1
+                  key: POSTGRES_PASSWORD
 ---
 apiVersion: v1
 kind: Service
@@ -53,3 +53,4 @@ spec:
       port: 5432
       targetPort: 5432
   type: ClusterIP
+
