@@ -1,158 +1,112 @@
-name: CD - Deploy Backend Services to AKS
+name: Backend CI - Test, Build & Push Images to ACR
 
 on:
   workflow_dispatch:
-    inputs:
-      aks_cluster_name:
-        description: 'AKS cluster name'
-        required: true
-        default: 'aks-demo'
-      aks_resource_group:
-        description: 'AKS resource group'
-        required: true
-        default: 'rg-aks-demo'
-      namespace:
-        description: 'Kubernetes namespace (dev or prod)'
-        required: true
-        default: 'dev'
-
-      # App Deployment names (NOT the DBs)
-      product_deploy_name:
-        description: 'Deployment name for product API'
-        required: true
-        default: 'product-service-w08e1'
-      order_deploy_name:
-        description: 'Deployment name for order API'
-        required: true
-        default: 'order-service-w08e1'
-
-      # Service names (to fetch LoadBalancer IPs)
-      product_service_name:
-        description: 'Service name for product API'
-        required: true
-        default: 'product-service-w08e1'
-      order_service_name:
-        description: 'Service name for order API'
-        required: true
-        default: 'order-service-w08e1'
-
-      # Pin app images to this commit’s tag
-      set_images:
-        description: 'Set app Deployment images to ACR images for this commit? (true/false)'
-        required: true
-        default: 'true'
+  push:
+    branches: [ development, main ]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend_ci.yml'
 
 env:
-  # e.g., mystudentregistry.azurecr.io
-  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}   # e.g. satyamstudentregistry.azurecr.io
+  ACR_NAME:         ${{ secrets.ACR_NAME }}
+  BRANCH:           ${{ github.ref_name }}            # development | main
+  SHA:              ${{ github.sha }}
 
 jobs:
-  deploy_backend:
+  test_and_lint_backends:
     runs-on: ubuntu-latest
-    environment: Production
-
-    outputs:
-      PRODUCT_API_URL: ${{ steps.make_outputs.outputs.product_url }}
-      ORDER_API_URL:   ${{ steps.make_outputs.outputs.order_url }}
-
+    services:
+      product_db:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: products
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+        ports: [ "5432:5432" ]
+      order_db:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: orders
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+        ports: [ "5433:5432" ]
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          for req in backend/*/requirements.txt; do pip install -r "$req"; done
+          pip install pytest httpx
+      - name: Test product_service
+        working-directory: backend/product_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: products
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: pytest -q
+      - name: Test order_service
+        working-directory: backend/order_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5433
+          POSTGRES_DB: orders
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: pytest -q
 
-      - name: Azure login (client secret)
+  build_and_push_images:
+    needs: test_and_lint_backends
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # OIDC login to Azure (uses the federated creds you created for main/dev)
+      - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Set AKS context
-        uses: azure/aks-set-context@v4
-        with:
-          resource-group: ${{ inputs.aks_resource_group }}
-          cluster-name:   ${{ inputs.aks_cluster_name }}
+      - name: ACR login
+        run: az acr login --name "${{ env.ACR_NAME }}"
 
-      - name: Ensure namespace exists
+      - name: Build & push product_service
         run: |
-          kubectl get ns "${{ inputs.namespace }}" || kubectl create ns "${{ inputs.namespace }}"
+          # build
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/product_service:latest ./backend/product_service/
+          # tag variants
+          docker tag  ${{ env.ACR_LOGIN_SERVER }}/product_service:latest ${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.BRANCH }}
+          docker tag  ${{ env.ACR_LOGIN_SERVER }}/product_service:latest ${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.SHA }}
+          # push all
+          docker push ${{ env.ACR_LOGIN_SERVER }}/product_service:latest
+          docker push ${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.BRANCH }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.SHA }}
 
-      - name: Apply backend infrastructure (ConfigMaps/Secrets/DBs)
+      - name: Build & push order_service
         run: |
-          kubectl -n "${{ inputs.namespace }}" apply -f k8s/configmaps.yaml
-          kubectl -n "${{ inputs.namespace }}" apply -f k8s/secrets.yaml
-          kubectl -n "${{ inputs.namespace }}" apply -f k8s/product-db.yaml
-          kubectl -n "${{ inputs.namespace }}" apply -f k8s/order-db.yaml
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/order_service:latest ./backend/order_service/
+          docker tag  ${{ env.ACR_LOGIN_SERVER }}/order_service:latest ${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.BRANCH }}
+          docker tag  ${{ env.ACR_LOGIN_SERVER }}/order_service:latest ${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.SHA }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/order_service:latest
+          docker push ${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.BRANCH }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.SHA }}
 
-      - name: Apply backend services (Deployments/Services)
-        run: |
-          kubectl -n "${{ inputs.namespace }}" apply -f k8s/product-service.yaml
-          kubectl -n "${{ inputs.namespace }}" apply -f k8s/order-service.yaml
-
-      # --- Set images ONLY for the app deployments (never DB) ---
-      - name: Set images to this commit (apps only, if requested)
-        if: ${{ inputs.set_images == 'true' }}
-        shell: bash
-        run: |
-          IMG_PROD="${{ env.ACR_LOGIN_SERVER }}/product_service:${{ github.sha }}"
-          IMG_ORDER="${{ env.ACR_LOGIN_SERVER }}/order_service:${{ github.sha }}"
-
-          echo "Setting image on ${{ inputs.product_deploy_name }} -> $IMG_PROD"
-          kubectl -n "${{ inputs.namespace }}" set image \
-            deploy/${{ inputs.product_deploy_name }} '*='"$IMG_PROD"
-
-          echo "Setting image on ${{ inputs.order_deploy_name }} -> $IMG_ORDER"
-          kubectl -n "${{ inputs.namespace }}" set image \
-            deploy/${{ inputs.order_deploy_name }} '*='"$IMG_ORDER"
-
-          kubectl -n "${{ inputs.namespace }}" rollout status deploy/${{ inputs.product_deploy_name }} --timeout=300s
-          kubectl -n "${{ inputs.namespace }}" rollout status deploy/${{ inputs.order_deploy_name }}   --timeout=300s
-
-      - name: Ensure Services are type LoadBalancer
-        run: |
-          kubectl -n "${{ inputs.namespace }}" patch svc "${{ inputs.product_service_name }}" -p '{"spec":{"type":"LoadBalancer"}}' --type=merge || true
-          kubectl -n "${{ inputs.namespace }}" patch svc "${{ inputs.order_service_name }}"   -p '{"spec":{"type":"LoadBalancer"}}' --type=merge || true
-
-      - name: Wait for LoadBalancer IPs/hostnames (up to 5 min)
-        id: wait_ips
-        shell: bash
-        run: |
-          NS="${{ inputs.namespace }}"
-          PSVC="${{ inputs.product_service_name }}"
-          OSVC="${{ inputs.order_service_name }}"
-
-          for i in $(seq 1 60); do
-            echo "Attempt $i/60..."
-            P_IP=$(kubectl -n "$NS" get svc "$PSVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-            O_IP=$(kubectl -n "$NS" get svc "$OSVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-            P_HOST=$(kubectl -n "$NS" get svc "$PSVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-            O_HOST=$(kubectl -n "$NS" get svc "$OSVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-
-            [ -z "$P_IP" ] && P_IP="$P_HOST"
-            [ -z "$O_IP" ] && O_IP="$O_HOST"
-
-            if [[ -n "$P_IP" && -n "$O_IP" ]]; then
-              echo "P_ADDR=$P_IP" >> $GITHUB_ENV
-              echo "O_ADDR=$O_IP" >> $GITHUB_ENV
-              echo "Product: $P_IP"
-              echo "Order:   $O_IP"
-              exit 0
-            fi
-            sleep 5
-          done
-
-          echo "LoadBalancer addresses not ready after timeout."
-          kubectl -n "$NS" get svc
-          exit 1
-
-      - name: Build service URLs & expose as outputs
-        id: make_outputs
-        shell: bash
-        run: |
-          P_URL="http://${P_ADDR}:8000"
-          O_URL="http://${O_ADDR}:8001"
-          echo "product_url=$P_URL" >> $GITHUB_OUTPUT
-          echo "order_url=$O_URL"   >> $GITHUB_OUTPUT
-          echo "Product API URL: $P_URL"
-          echo "Order   API URL: $O_URL"
-
-      - name: Azure logout
+      - name: Logout
         if: always()
         run: az logout
